@@ -111,7 +111,7 @@ const proofPlaceholders = [
     label: "Registry Contract",
     value: "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
   },
-  { label: "Agent Wallet", value: "[to be added]" },
+  { label: "Agent Wallet", value: "0x77177fF8e281e12C6a8131e94fD0AAc2Feefe01c" },
   { label: "Transaction Hash", value: "[to be added]" },
   { label: "8004scan Link", value: "[to be added]" },
 ];
