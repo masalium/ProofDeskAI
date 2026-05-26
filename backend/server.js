@@ -1,194 +1,283 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
+'use strict';
+require('dotenv').config(); // Must be first — modules read process.env at load time
+
+const express     = require('express');
+const cors        = require('cors');
 const TelegramBot = require('node-telegram-bot-api');
-const OpenAI = require('openai');
+const OpenAI      = require('openai');
 
-// ─── Config (values never logged) ───────────────────────────────────────────
-const PORT            = process.env.PORT || 3001;
-const AGENT_NAME      = process.env.AGENT_NAME || 'VendorLens';
-const CHAIN_ID        = process.env.GOAT_CHAIN_ID || '2345';
-const ERC8004_REGISTRY = process.env.ERC8004_REGISTRY;
-const METADATA_URI    = process.env.AGENT_METADATA_URI;
-const WALLET_ADDRESS  = process.env.AGENT_WALLET_ADDRESS;
-const MERCHANT_ID     = process.env.GOATX402_MERCHANT_ID;
+const cfg    = require('./src/config/safeConfig');
+const logger = require('./src/utils/logger');
 
-if (!process.env.TELEGRAM_BOT_TOKEN) {
-  console.error('[FATAL] TELEGRAM_BOT_TOKEN is not set in .env');
+const { generateFreeVendorPreview }                     = require('./src/workflows/vendorReviewWorkflow');
+const { generateDemoPremiumReport, generatePremiumSupplierMemo } = require('./src/workflows/premiumReportWorkflow');
+const {
+  PAYMENT_STATES,
+  startPremiumPaymentCheckpoint,
+  confirmPayment,
+  cancelPayment,
+  getPaymentStatus,
+  createX402Order,
+  getX402OrderStatus,
+  fetchX402Proof,
+}                                                       = require('./src/workflows/x402PaymentWorkflow');
+const { getIdentityProof }                             = require('./src/workflows/identityProofWorkflow');
+const { classifyRisk, guardrailResponse }               = require('./src/policies/guardrails');
+const { getSession, updateSession }                     = require('./src/state/sessionStore');
+
+// ─── Startup guards ───────────────────────────────────────────────────────────
+if (!cfg.hasTelegramToken) {
+  logger.error('server', 'TELEGRAM_BOT_TOKEN is not set in .env — cannot start');
   process.exit(1);
 }
-if (!process.env.OPENAI_API_KEY) {
-  console.error('[FATAL] OPENAI_API_KEY is not set in .env');
-  process.exit(1);
+if (!cfg.hasOpenAIKey) {
+  logger.warn('server', 'OPENAI_API_KEY not set — /review_vendor will return an error until configured');
+}
+if (!cfg.hasX402Config) {
+  logger.warn('server', 'x402 credentials not fully configured — payment flow will use Phase 1 demo mode');
 }
 
-// ─── Clients ─────────────────────────────────────────────────────────────────
-const bot    = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// ─── Clients ──────────────────────────────────────────────────────────────────
+const bot    = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false });
+const openai = cfg.hasOpenAIKey
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 
-// ─── Express ──────────────────────────────────────────────────────────────────
+// ─── Express health route ─────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 app.get('/', (_req, res) => {
   res.json({
-    status: 'ok',
-    agent: AGENT_NAME,
-    chain: `GOAT Mainnet (Chain ID ${CHAIN_ID})`,
-    services: {
-      telegram:     'configured',
-      openai:       'configured',
-      metadataUri:  METADATA_URI && !METADATA_URI.includes('YOUR_WEBSITE') ? 'configured' : 'placeholder',
-      walletAddress: WALLET_ADDRESS && !WALLET_ADDRESS.includes('PASTE_') ? 'configured' : 'placeholder',
-      x402MerchantId: MERCHANT_ID && MERCHANT_ID !== 'pending' ? 'configured' : 'pending',
-    },
-    timestamp: new Date().toISOString(),
+    ok:       true,
+    service:  'VendorLens Agent',
+    phase:    'phase-3-x402-real',
+    telegram: cfg.hasTelegramToken ? 'configured' : 'not configured',
+    openai:   cfg.hasOpenAIKey     ? 'configured' : 'not configured',
+    x402:     cfg.hasX402Config    ? 'configured' : 'demo-mode',
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`[${AGENT_NAME}] Express health check → http://localhost:${PORT}/`);
+// ─── x402 API routes ──────────────────────────────────────────────────────────
+
+app.post('/api/x402/create-order', async (req, res) => {
+  const { chatId } = req.body;
+  if (!chatId) return res.status(400).json({ ok: false, error: 'chatId required' });
+  if (!cfg.hasX402Config) {
+    return res.status(503).json({ ok: false, error: 'x402 not configured', mode: 'demo' });
+  }
+  const session = getSession(String(chatId));
+  try {
+    const order = await createX402Order({ session, chatId: String(chatId) });
+    res.json({
+      ok:           true,
+      orderId:      order.orderId,
+      payToAddress: order.payToAddress,
+      tokenSymbol:  order.tokenSymbol,
+      amountWei:    order.amountWei,
+      expiresAt:    order.expiresAt,
+      flow:         order.flow,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message.slice(0, 200) });
+  }
 });
 
-// ─── State ────────────────────────────────────────────────────────────────────
-const awaitingPayment = new Set(); // chatIds waiting for CONFIRM PAYMENT
+app.get('/api/x402/status/:orderId', async (req, res) => {
+  const { orderId } = req.params;
+  if (!cfg.hasX402Config) {
+    return res.status(503).json({ ok: false, error: 'x402 not configured', mode: 'demo' });
+  }
+  try {
+    const status = await getX402OrderStatus({ orderId });
+    res.json({
+      ok:          true,
+      orderId:     status.orderId || orderId,
+      status:      status.status,
+      txHash:      status.txHash      || null,
+      confirmedAt: status.confirmedAt || null,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message.slice(0, 200) });
+  }
+});
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-function configLabel(val, badPatterns = []) {
+app.get('/api/x402/debug', (_req, res) => {
+  res.json({
+    ok:                  true,
+    x402ApiUrl:          cfg.x402ApiUrl,
+    x402ApiUrlPresent:   !!process.env.GOATX402_API_URL,
+    merchantIdPresent:   cfg.hasX402MerchantId,
+    merchantId:          cfg.hasX402MerchantId ? cfg.merchantId : null,
+    apiKeyPresent:       cfg.hasX402ApiKey,
+    apiSecretPresent:    cfg.hasX402ApiSecret,
+    receivingWallet:     cfg.x402ReceivingWallet || cfg.walletAddress || null,
+    tokenSymbol:         cfg.x402TokenSymbol,
+    amount:              cfg.x402Amount,
+    hasX402Config:       cfg.hasX402Config,
+    mode:                cfg.hasX402Config ? 'real' : 'demo',
+  });
+});
+
+app.get('/api/x402/proof/:orderId', async (req, res) => {
+  const { orderId } = req.params;
+  if (!cfg.hasX402Config) {
+    return res.status(503).json({ ok: false, error: 'x402 not configured', mode: 'demo' });
+  }
+  try {
+    const proof = await fetchX402Proof({ orderId });
+    res.json({
+      ok:        true,
+      orderId:   proof.payload?.order_id   || orderId,
+      txHash:    proof.payload?.tx_hash    || null,
+      fromAddr:  proof.payload?.from_addr  || null,
+      amountWei: proof.payload?.amount_wei || null,
+      chainId:   proof.payload?.chain_id   || null,
+      flow:      proof.payload?.flow       || null,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message.slice(0, 200) });
+  }
+});
+
+app.listen(cfg.port, () => {
+  logger.info(cfg.agentName, `Express health check → http://localhost:${cfg.port}/`);
+});
+
+// ─── Local helper ─────────────────────────────────────────────────────────────
+function cfgLabel(val, badPatterns = []) {
   if (!val) return '❌ not configured';
   if (badPatterns.some(p => val.includes(p))) return '⚠️  placeholder (update .env)';
   return '✅ configured';
 }
 
-const HIGH_RISK_RE = [
-  /increase\s+(my\s+)?spending\s+limit/i,
-  /auto[- ]?approve\s+(supplier\s+)?payment/i,
-  /approve\s+supplier\s+payment\s+auto/i,
-  /send\s+funds/i,
-  /transfer\s+funds/i,
-  /(change|update|modify)\s+(my\s+)?wallet/i,
-  /(update|modify)\s+merchant\s+settings/i,
-];
-
-function isHighRisk(text) {
-  return HIGH_RISK_RE.some(re => re.test(text));
-}
-
-const GUARDRAIL_MSG =
-`⛔ *Security Guardrail — Action Blocked*
-
-This agent is read-only and cannot execute financial operations or modify account settings.
-
-Actions I will *never* perform:
-• Increase or modify spending limits
-• Auto-approve supplier payments
-• Send or transfer funds
-• Change or update wallet addresses
-• Modify merchant settings
-
-Please use your organization's authorized procurement platform with proper human approval workflows for these actions.
-
-Type /help to see what I can do.`;
-
-// ─── Commands ────────────────────────────────────────────────────────────────
-
+// ─── /start ───────────────────────────────────────────────────────────────────
 bot.onText(/\/start/, (msg) => {
   const name = msg.from?.first_name || 'there';
   bot.sendMessage(msg.chat.id,
-    `👋 Hello ${name}! I'm *${AGENT_NAME}* — your AI-powered supplier verification agent on GOAT Mainnet.\n\n` +
+    `👋 Hello ${name}! I'm *${cfg.agentName}* — your AI-powered supplier verification agent on GOAT Mainnet.\n\n` +
     `I help procurement teams verify vendors before payment, flag risk signals, and generate on-chain supplier memos.\n\n` +
     `Type /help to see all commands.`,
     { parse_mode: 'Markdown' }
   );
 });
 
+// ─── /help ────────────────────────────────────────────────────────────────────
 bot.onText(/\/help/, (msg) => {
   bot.sendMessage(msg.chat.id,
-    `📋 *${AGENT_NAME} — Commands*\n\n` +
+    `📋 *${cfg.agentName} — Commands*\n\n` +
+
     `*Vendor Verification*\n` +
     `/review\\_vendor <name> | <website> | <purchase context>\n` +
     `  → Free AI preview: risk flags, summary, recommendation\n\n` +
+
     `*Premium Report*\n` +
     `/unlock\\_premium\\_report\n` +
     `  → Full verified memo via x402 payment (0.1 USDC, GOAT Mainnet)\n\n` +
+
     `*Identity & Status*\n` +
     `/show\\_identity — This agent's ERC-8004 on-chain identity\n` +
     `/status — Service configuration health\n\n` +
+
     `*General*\n` +
     `/start — Welcome message\n` +
     `/cancel — Cancel current operation\n` +
+    `/judge\\_demo — Hackathon demo sequence\n` +
     `/help — This message\n\n` +
+
+    `*Payment behavior:* Premium reports require 0.1 USDC via x402 on GOAT Mainnet. ` +
+    `Payment confirmation is always manual — I never charge automatically.\n\n` +
+
+    `*Safety:* I will never send funds, approve payments, or modify account settings autonomously. ` +
+    `Any risky action requires explicit human authorization.\n\n` +
+
+    `*Identity:* This agent is an ERC-8004 registered AI agent on GOAT Mainnet (Chain ID ${cfg.chainId}).\n\n` +
+
     `You can also ask: _"what do you do?"_`,
     { parse_mode: 'Markdown' }
   );
 });
 
+// ─── /status ─────────────────────────────────────────────────────────────────
 bot.onText(/\/status/, (msg) => {
-  bot.sendMessage(msg.chat.id,
-    `🔧 *${AGENT_NAME} — Service Status*\n\n` +
+  const chatId   = msg.chat.id;
+  const session  = getSession(chatId);
+  const payState = getPaymentStatus(session);
+  const orderId  = session.x402OrderId || null;
+  const orderLine = orderId ? `Order ID:          \`${orderId}\`` : 'Order ID:          none';
+
+  bot.sendMessage(chatId,
+    `🔧 *${cfg.agentName} — Service Status*\n\n` +
     `Telegram Bot:      ✅ configured (polling active)\n` +
-    `OpenAI API:        ✅ configured\n` +
-    `Metadata URI:      ${configLabel(METADATA_URI, ['YOUR_WEBSITE'])}\n` +
-    `Wallet Address:    ${configLabel(WALLET_ADDRESS, ['PASTE_'])}\n` +
-    `x402 Merchant ID:  ${MERCHANT_ID && MERCHANT_ID !== 'pending' ? '✅ configured' : '⚠️  pending'}\n\n` +
-    `Chain: GOAT Mainnet (Chain ID ${CHAIN_ID})\n` +
-    `ERC-8004 Registry: ${configLabel(ERC8004_REGISTRY)}\n\n` +
+    `OpenAI API:        ${cfg.hasOpenAIKey      ? '✅ configured' : '❌ not configured'}\n` +
+    `x402 Config:       ${cfg.hasX402Config     ? '✅ configured' : '⚠️  not fully configured'}\n` +
+    `Identity Config:   ${cfg.hasIdentityConfig ? '✅ configured' : '⚠️  placeholder values'}\n\n` +
+    `Metadata URI:      ${cfgLabel(cfg.metadataUri,   ['YOUR_WEBSITE'])}\n` +
+    `Wallet Address:    ${cfgLabel(cfg.walletAddress, ['PASTE_'])}\n` +
+    `x402 Merchant ID:  ${cfg.merchantId && !cfg.merchantId.includes('PASTE_') && cfg.merchantId !== 'pending'
+                           ? '✅ configured' : '⚠️  pending'}\n\n` +
+    `Chain:             GOAT Mainnet (Chain ID ${cfg.chainId})\n` +
+    `ERC-8004 Registry: \`${cfg.erc8004Registry}\`\n\n` +
+    `*Payment State:*   ${payState}\n` +
+    `${orderLine}\n\n` +
     `_Secret values are never displayed._`,
     { parse_mode: 'Markdown' }
   );
 });
 
+// ─── /cancel ─────────────────────────────────────────────────────────────────
 bot.onText(/\/cancel/, (msg) => {
-  awaitingPayment.delete(msg.chat.id);
-  bot.sendMessage(msg.chat.id, '✅ Operation cancelled. Type /help to see available commands.');
+  const chatId = msg.chat.id;
+  const session = getSession(chatId);
+  cancelPayment(session);
+  updateSession(chatId, { pendingPayment: false, paymentState: PAYMENT_STATES.IDLE });
+  bot.sendMessage(chatId, '✅ Operation cancelled. Type /help to see available commands.');
 });
 
-bot.onText(/\/show_identity/, (msg) => {
-  const walletLine = (WALLET_ADDRESS && !WALLET_ADDRESS.includes('PASTE_'))
-    ? `\`${WALLET_ADDRESS}\``
-    : '_(not set — update AGENT\\_WALLET\\_ADDRESS in .env)_';
-
-  const metaLine = (METADATA_URI && !METADATA_URI.includes('YOUR_WEBSITE'))
-    ? METADATA_URI
-    : '_(placeholder — update AGENT\\_METADATA\\_URI in .env)_';
-
-  bot.sendMessage(msg.chat.id,
-    `🪪 *${AGENT_NAME} — On-Chain Identity (ERC-8004)*\n\n` +
-    `Network:             GOAT Mainnet\n` +
-    `Chain ID:            ${CHAIN_ID}\n` +
-    `ERC-8004 Registry:   \`${ERC8004_REGISTRY || 'not set'}\`\n\n` +
-    `Agent Metadata URI:  ${metaLine}\n` +
-    `Public Wallet:       ${walletLine}\n\n` +
-    `Transaction Hash:    _(Phase 1 — registration not yet submitted)_\n` +
-    `Agent ID:            _(Phase 1 — assigned after on-chain registration)_\n\n` +
-    `ℹ️ ERC-8004 registration will be completed in Phase 2.`,
-    { parse_mode: 'Markdown' }
-  );
+// ─── /show_identity ───────────────────────────────────────────────────────────
+bot.onText(/\/show_identity/, async (msg) => {
+  const chatId = msg.chat.id;
+  const text   = getIdentityProof();
+  try {
+    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+  } catch (err) {
+    logger.error(cfg.agentName, `show_identity Markdown failed: ${err.message}`);
+    // Fallback: send as plain text so the user always gets a reply
+    try {
+      await bot.sendMessage(chatId, text.replace(/[*_`]/g, ''));
+    } catch (e) {
+      logger.error(cfg.agentName, `show_identity plain-text fallback also failed: ${e.message}`);
+    }
+  }
 });
 
-bot.onText(/\/unlock_premium_report/, (msg) => {
-  awaitingPayment.add(msg.chat.id);
-
-  const merchantLine = (MERCHANT_ID && MERCHANT_ID !== 'pending')
-    ? `\`${MERCHANT_ID}\``
-    : '_(pending — update GOATX402\\_MERCHANT\\_ID in .env)_';
-
-  bot.sendMessage(msg.chat.id,
-    `🔐 *Premium Supplier Memo — Payment Required*\n\n` +
-    `To unlock the full verified supplier report, a micro-payment is required:\n\n` +
-    `━━━━━━━━━━━━━━━━━━━\n` +
-    `Protocol:    x402\n` +
-    `Network:     GOAT Mainnet\n` +
-    `Amount:      0.1 USDC\n` +
-    `Merchant ID: ${merchantLine}\n` +
-    `Purpose:     Unlock premium supplier memo\n` +
-    `━━━━━━━━━━━━━━━━━━━\n\n` +
-    `Reply with \`CONFIRM PAYMENT\` to proceed, or /cancel to abort.`,
-    { parse_mode: 'Markdown' }
-  );
+// ─── /unlock_premium_report ───────────────────────────────────────────────────
+bot.onText(/\/unlock_premium_report/, async (msg) => {
+  const chatId  = msg.chat.id;
+  const session = getSession(chatId);
+  let result;
+  try {
+    result = await startPremiumPaymentCheckpoint(session, chatId);
+  } catch (err) {
+    logger.error(cfg.agentName, `startPremiumPaymentCheckpoint threw: ${err.message}`);
+    return bot.sendMessage(chatId,
+      `❌ Payment checkpoint failed — please try again or check configuration.`
+    );
+  }
+  updateSession(chatId, { pendingPayment: true });
+  try {
+    await bot.sendMessage(chatId, result.message, { parse_mode: 'Markdown' });
+  } catch (err) {
+    logger.error(cfg.agentName, `unlock_premium_report send failed: ${err.message}`);
+    await bot.sendMessage(chatId,
+      `Payment checkpoint — 0.1 USDC via x402 on GOAT Mainnet.\n` +
+      `Reply: CONFIRM PAYMENT to proceed, or /cancel to abort.`
+    );
+  }
 });
 
+// ─── /review_vendor ───────────────────────────────────────────────────────────
 bot.onText(/\/review_vendor(?:\s+(.+))?/, async (msg, match) => {
   const chatId = msg.chat.id;
   const input  = (match[1] || '').trim();
@@ -213,119 +302,262 @@ bot.onText(/\/review_vendor(?:\s+(.+))?/, async (msg, match) => {
   }
 
   const [vendorName, website, purchaseContext] = parts;
+  updateSession(chatId, { vendorName, website, purchaseContext });
+
+  if (!openai) {
+    return bot.sendMessage(chatId,
+      `❌ *Vendor analysis unavailable*\n\nOPENAI\\_API\\_KEY is not configured. Update backend/.env to enable AI reviews.`,
+      { parse_mode: 'Markdown' }
+    );
+  }
 
   await bot.sendMessage(chatId,
     `🔍 Analyzing *${vendorName}* — this may take a few seconds…`,
     { parse_mode: 'Markdown' }
   );
 
-  const systemPrompt =
-    `You are ${AGENT_NAME}, an AI supplier verification agent for B2B procurement teams. ` +
-    `Analyze the vendor and return a structured free-preview risk report. ` +
-    `Be concise and specific. Flag genuine risk signals if evident; note what verification is still needed if not.`;
+  const result = await generateFreeVendorPreview({ openai, vendorName, website, purchaseContext });
 
-  const userPrompt =
-    `Vendor Name: ${vendorName}\n` +
-    `Website: ${website}\n` +
-    `Purchase Context: ${purchaseContext}\n\n` +
-    `Respond in exactly this format:\n\n` +
-    `**VENDOR SUMMARY**\n[2-3 sentences]\n\n` +
-    `**INITIAL RISK FLAGS**\n[Bullet list, or "No immediate red flags — further verification recommended"]\n\n` +
-    `**MISSING INFORMATION**\n[What docs/data are needed for full verification]\n\n` +
-    `**RECOMMENDATION PREVIEW**\n[One clear line: Low risk / Proceed with caution / Request additional docs / High risk — do not proceed]\n\n` +
-    `**NEXT STEP**\n[Single action item for the procurement team]\n\n` +
-    `---\nNote: This is a free preview. Use /unlock_premium_report for the full on-chain verified memo.`;
-
-  try {
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user',   content: userPrompt   },
-      ],
-      max_tokens: 700,
-      temperature: 0.3,
-    });
-
-    const report = completion.choices[0].message.content;
-
-    await bot.sendMessage(chatId,
-      `📊 *Vendor Review: ${vendorName}*\n_Free Preview_\n\n${report}\n\n` +
-      `━━━━━━━━━━━━━━━━━━━\n` +
-      `Use /unlock\\_premium\\_report for the full verified memo with on-chain attestation.`,
-      { parse_mode: 'Markdown' }
-    );
-  } catch (err) {
-    console.error('[OpenAI error]', err.message);
-    await bot.sendMessage(chatId,
+  if (!result.ok) {
+    return bot.sendMessage(chatId,
       `❌ *Vendor analysis failed*\n\n` +
       `The AI service returned an error. Please try again in a moment.\n` +
       `If the problem persists, verify your OPENAI_API_KEY in .env.`,
       { parse_mode: 'Markdown' }
     );
   }
+
+  await bot.sendMessage(chatId,
+    `📊 *Vendor Review: ${vendorName}*\n_Free Preview_\n\n${result.report}\n\n` +
+    `━━━━━━━━━━━━━━━━━━━\n` +
+    `Use /unlock\\_premium\\_report for the full verified memo with on-chain attestation.`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
-// ─── General message handler ─────────────────────────────────────────────────
-bot.on('message', (msg) => {
+// ─── /debug_x402 ─────────────────────────────────────────────────────────────
+bot.onText(/\/debug_x402/, (msg) => {
+  const merchantLine = cfg.hasX402MerchantId
+    ? `✅ present (\`${cfg.merchantId}\`)`
+    : '❌ missing or placeholder';
+  const walletLine = (cfg.x402ReceivingWallet || cfg.walletAddress)
+    ? `✅ \`${cfg.x402ReceivingWallet || cfg.walletAddress}\``
+    : '❌ not set';
+
+  bot.sendMessage(msg.chat.id,
+    `🔧 *x402 Diagnostics*\n\n` +
+    `API URL:          \`${cfg.x402ApiUrl}\`\n` +
+    `Merchant ID:      ${merchantLine}\n` +
+    `API Key:          ${cfg.hasX402ApiKey    ? '✅ present (value hidden)' : '❌ missing or placeholder'}\n` +
+    `API Secret:       ${cfg.hasX402ApiSecret ? '✅ present (value hidden)' : '❌ missing or placeholder'}\n` +
+    `Receiving Wallet: ${walletLine}\n` +
+    `Token Symbol:     ${cfg.x402TokenSymbol}\n` +
+    `Amount:           ${cfg.x402Amount}\n` +
+    `hasX402Config:    ${cfg.hasX402Config ? '✅ true — real mode' : '❌ false — demo mode'}\n\n` +
+    `*SDK:* goatx402-sdk-server (GoatX402Client)\n` +
+    `*Endpoint tested:* \`${cfg.x402ApiUrl}/api/v1/orders\`\n\n` +
+    `_Secret values are never displayed. Check terminal logs for full error detail._`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ─── /retry_payment ──────────────────────────────────────────────────────────
+bot.onText(/\/retry_payment/, async (msg) => {
+  const chatId  = msg.chat.id;
+  const session = getSession(chatId);
+  const state   = getPaymentStatus(session);
+
+  if (state === PAYMENT_STATES.PAYMENT_VERIFIED) {
+    return bot.sendMessage(chatId,
+      `✅ Payment already verified — no retry needed.\n\nYour premium report has been unlocked.`
+    );
+  }
+
+  // Recheck active order
+  if (state === PAYMENT_STATES.ORDER_CREATED || state === PAYMENT_STATES.PAYMENT_PENDING) {
+    let result;
+    try {
+      result = await confirmPayment(session);
+    } catch (err) {
+      logger.error(cfg.agentName, `retry_payment confirmPayment threw: ${err.message}`);
+      return bot.sendMessage(chatId, `❌ Status check failed — please try again.`);
+    }
+    try {
+      await bot.sendMessage(chatId, result.message, { parse_mode: 'Markdown' });
+    } catch (err) {
+      await bot.sendMessage(chatId, result.message.replace(/[*_`]/g, ''));
+    }
+    if (result.state === PAYMENT_STATES.PAYMENT_VERIFIED && result.mode === 'real') {
+      const report = generatePremiumSupplierMemo({ session, proof: result.proof, orderProof: result.orderProof });
+      try {
+        await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+      } catch (err) {
+        await bot.sendMessage(chatId, report.replace(/[*_`]/g, ''));
+      }
+    }
+    return;
+  }
+
+  // Terminal states — clear and start fresh
+  if (
+    state === PAYMENT_STATES.PAYMENT_FAILED  ||
+    state === PAYMENT_STATES.PAYMENT_EXPIRED ||
+    state === PAYMENT_STATES.CANCELLED
+  ) {
+    updateSession(chatId, {
+      x402OrderId: null, x402DappOrderId: null, x402PayToAddress: null,
+      x402TokenSymbol: null, x402AmountWei: null, x402ExpiresAt: null,
+      x402Flow: null, x402TxHash: null, paymentState: PAYMENT_STATES.IDLE,
+    });
+    let result;
+    try {
+      result = await startPremiumPaymentCheckpoint(session, chatId);
+    } catch (err) {
+      logger.error(cfg.agentName, `retry_payment startPremiumPaymentCheckpoint threw: ${err.message}`);
+      return bot.sendMessage(chatId, `❌ Failed to create new order — please use /unlock\\_premium\\_report.`, { parse_mode: 'Markdown' });
+    }
+    updateSession(chatId, { pendingPayment: true });
+    try {
+      await bot.sendMessage(chatId, result.message, { parse_mode: 'Markdown' });
+    } catch (err) {
+      await bot.sendMessage(chatId, result.message.replace(/[*_`]/g, ''));
+    }
+    return;
+  }
+
+  // IDLE / demo / not started
+  bot.sendMessage(chatId,
+    `ℹ️ No active payment to retry. Use /unlock\\_premium\\_report to start.`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ─── /judge_demo ─────────────────────────────────────────────────────────────
+bot.onText(/\/judge_demo/, (msg) => {
+  const x402Mode = cfg.hasX402Config ? '✅ real x402 flow' : '⚠️  demo mode (credentials not configured)';
+  bot.sendMessage(msg.chat.id,
+    `🎯 *${cfg.agentName} — Hackathon Demo Sequence*\n\n` +
+    `Run these steps in order to demonstrate all features:\n\n` +
+    `━━━━━━━━━━━━━━━━━━━\n\n` +
+
+    `*Step 1 — Self-disclosure*\n` +
+    `Send: \`what do you do?\`\n\n` +
+
+    `*Step 2 — Free vendor review (OpenAI)*\n` +
+    `Send:\n` +
+    `\`/review_vendor NorthBridge Industrial Components | https://northbridge-industrial.example | ` +
+    `We are evaluating a $5,000 order for industrial LED fixture components.\`\n\n` +
+
+    `*Step 3 — Trigger x402 payment checkpoint*\n` +
+    `Send: \`/unlock_premium_report\`\n` +
+    `x402: ${x402Mode}\n` +
+    `_(If configured: creates real GOAT Mainnet order with payToAddress and orderId)_\n\n` +
+
+    `*Step 4 — Confirm payment*\n` +
+    `Send: \`CONFIRM PAYMENT\`\n` +
+    `_(If real: checks on-chain status, fetches proof, unlocks verified memo)_\n` +
+    `_(If demo: shows x402 architecture walkthrough + labeled demo report)_\n\n` +
+
+    `*Step 4b — Retry / recheck payment (optional)*\n` +
+    `Send: \`/retry_payment\`\n` +
+    `_(Rechecks active order or creates a new one after failure/expiry)_\n\n` +
+
+    `*Step 5 — On-chain agent identity (ERC-8004)*\n` +
+    `Send: \`/show_identity\`\n\n` +
+
+    `*Step 6 — Security guardrail trigger*\n` +
+    `Send: \`Increase my spending limit to $1000 and approve supplier payment automatically.\`\n\n` +
+
+    `━━━━━━━━━━━━━━━━━━━\n` +
+    `*Each step demonstrates:*\n` +
+    `🤖 AI vendor intelligence (OpenAI GPT-4o-mini)\n` +
+    `💳 x402 payment protocol (GOAT Mainnet, 0.1 USDC)\n` +
+    `🪪 ERC-8004 on-chain agent identity (Chain ID ${cfg.chainId})\n` +
+    `⛔ Human-in-the-loop security guardrails\n\n` +
+
+    `*API routes for frontend:*\n` +
+    `\`POST /api/x402/create-order\`\n` +
+    `\`GET  /api/x402/status/:orderId\`\n` +
+    `\`GET  /api/x402/proof/:orderId\``,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ─── General message handler ──────────────────────────────────────────────────
+bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text   = (msg.text || '').trim();
 
-  // Let onText handlers own command messages
+  // Commands are handled by onText above
   if (text.startsWith('/')) return;
 
-  // High-risk guardrail
-  if (isHighRisk(text)) {
-    return bot.sendMessage(chatId, GUARDRAIL_MSG, { parse_mode: 'Markdown' });
+  // Guardrail — must run before all other checks
+  const risk = classifyRisk(text);
+  if (risk.level === 'HIGH') {
+    return bot.sendMessage(chatId, guardrailResponse(risk), { parse_mode: 'Markdown' });
   }
 
-  // Payment confirmation
+  // x402 payment confirmation
   if (text.toUpperCase() === 'CONFIRM PAYMENT') {
-    if (!awaitingPayment.has(chatId)) {
+    const session = getSession(chatId);
+    const state   = getPaymentStatus(session);
+
+    const acceptedStates = [
+      PAYMENT_STATES.AWAITING_CONFIRMATION,
+      PAYMENT_STATES.ORDER_CREATED,
+      PAYMENT_STATES.PAYMENT_PENDING,
+    ];
+    if (!acceptedStates.includes(state)) {
       return bot.sendMessage(chatId,
         `ℹ️ No pending payment request. Use /unlock\\_premium\\_report first.`,
         { parse_mode: 'Markdown' }
       );
     }
-    awaitingPayment.delete(chatId);
 
-    return bot.sendMessage(chatId,
-      `⚠️ *x402 verification is not connected yet in Phase 1.*\n\n` +
-      `Here is what the full x402 flow will do in Phase 2:\n\n` +
-      `1️⃣  *Create Order* — Agent posts a signed payment request to the x402 gateway with merchant ID, amount (0.1 USDC), and purpose\n` +
-      `2️⃣  *Show Payment Details* — User receives a GOAT Mainnet payment address and invoice ID\n` +
-      `3️⃣  *Poll Status* — Agent polls the x402 gateway every few seconds until on-chain confirmation is detected\n` +
-      `4️⃣  *Fetch Proof* — Agent retrieves the x402 payment receipt and GOAT transaction hash\n` +
-      `5️⃣  *Unlock Report* — Payment proof is verified on-chain and the full supplier memo is released\n\n` +
-      `━━━━━━━━━━━━━━━━━━━\n` +
-      `📄 *DEMO OUTPUT — Premium Supplier Memo*\n` +
-      `_(Phase 1 placeholder — not real data)_\n` +
-      `━━━━━━━━━━━━━━━━━━━\n\n` +
-      `*Full Vendor Identity Verification*\n` +
-      `• Business registration: Confirmed _(demo)_\n` +
-      `• Incorporation date: 2018-03-14 _(demo)_\n` +
-      `• Registered jurisdiction: Delaware, USA _(demo)_\n\n` +
-      `*Financial Health Signals*\n` +
-      `• Trade credit score: B+ _(demo)_\n` +
-      `• Payment history: 94% on-time _(demo)_\n` +
-      `• Outstanding liens: None found _(demo)_\n\n` +
-      `*Compliance & Sanctions Screening*\n` +
-      `• OFAC screening: Clear _(demo)_\n` +
-      `• PEP / adverse media: No matches _(demo)_\n` +
-      `• Import / export restrictions: None _(demo)_\n\n` +
-      `*On-Chain Attestation*\n` +
-      `• Attestation TX: _(pending Phase 2)_\n` +
-      `• GOAT Mainnet block: _(pending Phase 2)_\n` +
-      `• Proof hash: _(pending Phase 2)_\n\n` +
-      `_Real data and on-chain proof will be available in Phase 2 once x402 is connected._`,
-      { parse_mode: 'Markdown' }
-    );
+    let result;
+    try {
+      result = await confirmPayment(session);
+    } catch (err) {
+      logger.error(cfg.agentName, `confirmPayment threw: ${err.message}`);
+      return bot.sendMessage(chatId, `❌ Payment confirmation failed — please try again.`);
+    }
+
+    try {
+      await bot.sendMessage(chatId, result.message, { parse_mode: 'Markdown' });
+    } catch (err) {
+      logger.error(cfg.agentName, `confirmPayment message send failed: ${err.message}`);
+      await bot.sendMessage(chatId, result.message.replace(/[*_`]/g, ''));
+    }
+
+    // Real payment verified → generate full premium report with proof
+    if (result.state === PAYMENT_STATES.PAYMENT_VERIFIED && result.mode === 'real') {
+      const report = generatePremiumSupplierMemo({ session, proof: result.proof, orderProof: result.orderProof });
+      try {
+        await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+      } catch (err) {
+        logger.error(cfg.agentName, `premium memo send failed: ${err.message}`);
+        await bot.sendMessage(chatId, report.replace(/[*_`]/g, ''));
+      }
+      return;
+    }
+
+    // Demo confirmation → show demo report
+    if (result.demoReport) {
+      const report = generateDemoPremiumReport(session);
+      try {
+        await bot.sendMessage(chatId, report, { parse_mode: 'Markdown' });
+      } catch (err) {
+        logger.error(cfg.agentName, `demo report send failed: ${err.message}`);
+        await bot.sendMessage(chatId, report.replace(/[*_`]/g, ''));
+      }
+    }
+    return;
   }
 
   // Self-disclosure
   if (/what\s+(do|can)\s+you\s+do/i.test(text) || /what\s+are\s+you/i.test(text)) {
     return bot.sendMessage(chatId,
-      `🤖 *I'm ${AGENT_NAME} — an AI Supplier Verification Agent*\n\n` +
+      `🤖 *I'm ${cfg.agentName} — an AI Supplier Verification Agent*\n\n` +
       `I help procurement teams verify vendors before payment:\n\n` +
       `🔍 *Analyze suppliers* — summarize business info, flag risk signals, identify missing verification documents\n` +
       `💳 *Generate verified memos* — full on-chain supplier reports unlocked via x402 micro-payments on GOAT Mainnet (0.1 USDC)\n` +
@@ -344,6 +576,30 @@ bot.on('message', (msg) => {
   );
 });
 
-// ─── Startup log ─────────────────────────────────────────────────────────────
-console.log(`[${AGENT_NAME}] Bot started — polling Telegram`);
-console.log(`[${AGENT_NAME}] Chain: GOAT Mainnet (Chain ID ${CHAIN_ID})`);
+// ─── Startup: drain backlog then begin polling ────────────────────────────────
+// Calling getUpdates before startPolling discards any messages that accumulated
+// while the server was offline, preventing a flood of stale responses on restart.
+async function startPolling() {
+  logger.info(cfg.agentName, `Chain: GOAT Mainnet (Chain ID ${cfg.chainId})`);
+  logger.info(cfg.agentName, `ERC-8004 Registry: ${cfg.erc8004Registry}`);
+  logger.info(cfg.agentName, `Phase: phase-3-x402-real`);
+  logger.info(cfg.agentName, `OpenAI:    ${cfg.hasOpenAIKey ? 'configured' : 'not configured'}`);
+  logger.info(cfg.agentName, `x402 mode: ${cfg.hasX402Config ? 'configured (real)' : 'demo mode'}`);
+  logger.info(cfg.agentName, `x402 url:  ${cfg.x402ApiUrl}`);
+
+  try {
+    const stale = await bot.getUpdates({ timeout: 0, limit: 100 });
+    if (stale.length > 0) {
+      const maxId = Math.max(...stale.map(u => u.update_id));
+      await bot.getUpdates({ offset: maxId + 1, timeout: 0, limit: 1 });
+      logger.info(cfg.agentName, `Dropped ${stale.length} backlog message(s) — only new messages will be processed`);
+    }
+  } catch (err) {
+    logger.warn(cfg.agentName, `Backlog drain failed (non-fatal): ${err.message}`);
+  }
+
+  bot.startPolling();
+  logger.info(cfg.agentName, 'Polling started — ready for new messages');
+}
+
+startPolling();
